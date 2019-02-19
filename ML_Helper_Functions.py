@@ -94,7 +94,7 @@ def boolean_features(df):
 
 #Plots distribution of given categorical variable
 def categorical_plot(df, categorical_features, var):
-    plt.figure(figsize=(12,5)) 
+    plt.figure(figsize=(8,5)) 
     sns.countplot(df[categorical_features[var]])
     plt.show()
 
@@ -109,10 +109,15 @@ def categorical_to_scale(df, var):
     return new_df
 
 #Encodes categorical variables
-def onehot_encode(df):
+def onehot_encode(df, override = []):
     numericals = df.get(numerical_features(df))
     new_df = numericals.copy()
-    for categorical_column in categorical_features(df):
+
+    if len(override) >= 1:
+        cat = override
+    else:
+        cat = categorical_features(df)
+    for categorical_column in cat:
         new_df = pd.concat([new_df, pd.get_dummies(df[categorical_column], prefix = 
                 categorical_column)], axis=1)
         
@@ -210,21 +215,19 @@ def score_model(data, dependent_var, size, seed):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=size, random_state=seed)
     
     # Create logistic regression object
-    classifier = LogisticRegression(solver='lbfgs', max_iter=250, C=10000)
-    classifier.fit(X_train, y_train)
-    
+    classifier = LogisticRegression(solver='lbfgs')
+    classifier.fit(X_train, y_train)   
     return classifier.score(X_test, y_test)
 
-def cv_evaluate(df, target_var, C_input = 1000, splits=100):
+def cv_evaluate(df, target_var, seed, C_input = 1000, max_input = 100):
     # Create logistic regression object
-    lm = LogisticRegression(solver='lbfgs', max_iter=250, C = C_input)
-    kfolds = KFold(n_splits=10, shuffle=True, random_state=62592)
+    lm = LogisticRegression(solver='lbfgs', C = C_input, max_iter = max_input)
+    kfolds = KFold(n_splits=10, shuffle=True, random_state=seed)
 
     X = df.drop([target_var], axis=1)
     y = df.left.reset_index(drop=True)
     benchmark_model = make_pipeline(RobustScaler(), lm).fit(X=X, y=y)
-    scores = cross_val_score(benchmark_model, X, y, scoring='accuracy', cv=kfolds)
-    
+    scores = cross_val_score(benchmark_model, X, y, scoring='accuracy', cv=kfolds)   
     return scores[scores >= 0.0]
 
 def ROC_curve(model, y_test_set, X_test_set):
@@ -273,26 +276,26 @@ def under_represented_features(df):
 def binning(col, cut_points, labels=None):
     #Define min and max values:
     min_val = col.min()
-    max_val = col.max()
-    
+    max_val = col.max()    
     #create list by adding min and max to cut_points
     break_points = [min_val] + cut_points + [max_val]
-
     #if no labels provided, use default labels 0 ... (n-1)
     if not labels:
         labels = range(len(cut_points)+1)
-
     #Binning using cut function of pandas
     colBin = pd.cut(col, bins=break_points, labels=labels, include_lowest=True)
     return colBin
 
 #Choose variable to be binned and passed to binning function, output updated df
-def bin_continuous_var(df):
+def bin_continuous_var(df, override = ''):
     numerical = numerical_features(df)
     booleans = boolean_features(df)
     
     #Choose only continuous numerical variables to be binned
     binned_variables = (list(set(numerical) - set(booleans)))
+    
+    if len(override) > 0:
+        binned_variables.remove(override)
     
     #Bin based on median and 1 standard deviation above and below
     for var in binned_variables:
@@ -304,50 +307,60 @@ def bin_continuous_var(df):
     return df
 
 #Iteratively cycles throughout input feature engineering functions and determines their effect on the model
-def feature_engineering_pipeline(raw_data, dependent_var, sample_size, seed, fe_functions):
+def feature_engineering_pipeline(raw_data_total, raw_data_test, dependent_var, sample_size, seed, fe_functions):
     selected_functions = []
-    base_score = score_model(raw_data, dependent_var, sample_size, seed)
-    print('Base Accuracy: {:.4f}'.format(base_score))
-    engineered_data = raw_data.copy()
+    base_score = score_model(raw_data_test, dependent_var, sample_size, seed)
+    print('Base Accuracy on Training Set: {:.4f}'.format(base_score))
+    #Applying approved engineering on entire dataset, but testing its validity only on test set
+    engineered_data_total = raw_data_total.copy()
+    engineered_data_test = raw_data_test.copy()
     for fe_function in fe_functions:
-        processed_data = globals()[fe_function](engineered_data)
-        new_score = score_model(processed_data, dependent_var, sample_size, seed)
+        processed_data_total = globals()[fe_function](engineered_data_total)
+        processed_data_test = globals()[fe_function](engineered_data_test)
+        new_score = score_model(processed_data_test, dependent_var, sample_size, seed)
         print('- New Accuracy ({}): {:.4f} '.format(fe_function, new_score), 
               end='')
         difference = (new_score-base_score)
         print('[diff: {:.4f}] '.format(difference), end='')
         if difference > -0.01:
             selected_functions.append(fe_function)
-            engineered_data = processed_data.copy()
+            engineered_data_total = processed_data_total.copy()
+            engineered_data_test = processed_data_test.copy()
             base_score = new_score
             print('[Accepted]')
         else:
             print('[Rejected]')
-    return selected_functions, engineered_data
+    return selected_functions, engineered_data_total
 
-def feature_reduction(model, score_target, X_set, y_set):
+def feature_reduction(model, score_target, X_entire_set, X_train_set, y_train_set):
     # Create the RFE object and compute a cross-validated score.
     # The "accuracy" scoring is proportional to the number of correct classifications
     rfecv = RFECV(model, step=1, cv=10, scoring=score_target)
-    rfecv.fit(X_set, y_set.values.ravel())
+    rfecv.fit(X_train_set, y_train_set.values.ravel())
 
     print("Optimal number of features: %d" % rfecv.n_features_)
-    print('Selected features: %s' % list(X_set.columns[rfecv.support_]))
+    print('Selected features: %s' % list(X_train_set.columns[rfecv.support_]))
 
     # Plot number of features VS. cross-validation scores
-    plt.figure(figsize=(10,6))
+    plt.figure(figsize=(8,5))
     plt.xlabel("Number of features selected")
     plt.ylabel("Cross validation score (nb of correct classifications)")
     plt.plot(range(1, len(rfecv.grid_scores_) + 1), rfecv.grid_scores_)
     plt.show()
     
-    return X_set[X_set.columns[rfecv.support_]], rfecv.estimator_, rfecv.ranking_
+    return X_entire_set[X_entire_set.columns[rfecv.support_]], rfecv.estimator_
+
+#Remove engineered features that resulted in invalid entries
+def NaN_removal(df):
+    drop_cols = [x for x in df if df[x].isnull().sum() == len(df)]
+    output_df = df.drop(drop_cols, axis = 1)
+    print('Need to remove {} columns with invalid entries.'.format(len(drop_cols)))
+    return output_df
 
 #Standardization for Polynomial Feature
 def standardize2(df):
     standardized_numericals = preprocessing.scale(df)
-    df = standardized_numericals
-    
+    df = standardized_numericals  
     return df
 
 #Returns list of prediction accuracies
